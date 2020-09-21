@@ -129,6 +129,11 @@ class RemoteToken(db.Model, Timestamp):
     )
     """Access token to remote application."""
 
+    refresh_token = db.Column(
+        EncryptedType(type_in=db.Text, key=_secret_key), nullable=False
+    )
+    """Refresh token to remote application."""
+
     secret = db.Column(db.Text(), default='', nullable=False)
     """Used only by OAuth 1."""
 
@@ -148,17 +153,18 @@ class RemoteToken(db.Model, Timestamp):
 
     def token(self):
         """Get token as expected by Flask-OAuthlib."""
-        return (self.access_token, self.secret)
+        return (self.access_token, self.secret, self.refresh_token)
 
-    def update_token(self, token, secret):
+    def update_token(self, token, secret, refresh=None):
         """Update token with new values.
 
         :param token: The token value.
         :param secret: The secret key.
         """
-        if self.access_token != token or self.secret != secret:
+        if self.access_token != token or self.secret != secret or self.refresh_token != refresh:
             with db.session.begin_nested():
                 self.access_token = token
+                self.refresh_token = refresh
                 self.secret = secret
                 db.session.add(self)
 
@@ -205,7 +211,7 @@ class RemoteToken(db.Model, Timestamp):
 
     @classmethod
     def create(cls, user_id, client_id, token, secret,
-               token_type='', extra_data=None):
+               token_type='', extra_data=None, refresh_token=None):
         """Create a new access token.
 
         .. note:: Creates RemoteAccount as well if it does not exists.
@@ -235,6 +241,7 @@ class RemoteToken(db.Model, Timestamp):
                 token_type=token_type,
                 remote_account=account,
                 access_token=token,
+                refresh_token=refresh_token,
                 secret=secret,
             )
             db.session.add(token)

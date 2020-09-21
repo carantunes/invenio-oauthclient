@@ -17,7 +17,9 @@ from flask import current_app, flash, jsonify, redirect, render_template, \
     request, session, url_for
 from flask_babelex import gettext as _
 from flask_login import current_user
+from flask_oauthlib.client import OAuthRemoteApp, parse_response
 from invenio_db import db
+from oauthlib.oauth2 import WebApplicationClient
 from six.moves.urllib_parse import urlencode
 from werkzeug.utils import import_string
 
@@ -130,11 +132,12 @@ def oauth2_token_setter(remote, resp, token_type='', extra_data=None):
         secret='',
         token_type=token_type,
         extra_data=extra_data,
+        refresh_token=resp['refresh_token']
     )
 
 
 def token_setter(remote, token, secret='', token_type='', extra_data=None,
-                 user=None):
+                 user=None, refresh_token=None):
     """Set token for user.
 
     :param remote: The remote application.
@@ -159,11 +162,11 @@ def token_setter(remote, token, secret='', token_type='', extra_data=None,
         t = RemoteToken.get(uid, cid, token_type=token_type)
 
         if t:
-            t.update_token(token, secret)
+            t.update_token(token, secret, refresh_token)
         else:
             t = RemoteToken.create(
                 uid, cid, token, secret,
-                token_type=token_type, extra_data=extra_data
+                token_type=token_type, extra_data=extra_data, refresh_token=refresh_token
             )
         return t
     return None
@@ -181,7 +184,7 @@ def token_getter(remote, token=''):
     """
     session_key = token_session_key(remote.name)
 
-    if session_key not in session and current_user.is_authenticated:
+    if current_user.is_authenticated:
         # Fetch key from token store if user is authenticated, and the key
         # isn't already cached in the session.
         remote_token = RemoteToken.get(
@@ -256,3 +259,27 @@ def authorized_handler(f, authorized_response):
             data = authorized_response()
             return f(*((data,) + args), **kwargs)
         return decorated
+
+
+def generate_token(remote: OAuthRemoteApp):
+    refresh_token = remote.get_request_token()[2]
+
+    client = remote.make_client() # type: WebApplicationClient
+    url, headers, body = client.prepare_refresh_token_request(
+        token_url=remote.access_token_url,
+        redirect_url=remote,
+        refresh_token=refresh_token,
+        client_id=remote.consumer_key,
+        client_secret=remote.consumer_secret,
+    )
+
+    resp, content = remote.http_request(
+        url, headers, data=body.encode('utf-8'),
+    )
+
+    data = parse_response(resp, content)
+    response_token_setter(remote, data)
+
+    current_app.logger.warning(f"generate_token: {data}")
+
+    return data

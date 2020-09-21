@@ -69,17 +69,19 @@ from datetime import datetime, timedelta
 from flask import Blueprint, current_app, flash, g, redirect, session, url_for
 from flask_babelex import gettext as _
 from flask_login import current_user
+from flask_oauthlib.client import OAuthResponse, OAuthRemoteApp
 from flask_principal import AnonymousIdentity, RoleNeed, UserNeed, \
     identity_changed, identity_loaded
 from invenio_db import db
 from jwt import decode
 
-from invenio_oauthclient.errors import OAuthCERNRejectedAccountError
+from invenio_oauthclient.errors import OAuthCERNRejectedAccountError, OAuthClientUnAuthorized
 from invenio_oauthclient.handlers.rest import response_handler
 from invenio_oauthclient.models import RemoteAccount
 from invenio_oauthclient.proxies import current_oauthclient
 from invenio_oauthclient.utils import oauth_link_external_id, \
     oauth_unlink_external_id
+from invenio_oauthclient.handlers.utils import generate_token
 
 OAUTHCLIENT_CERN_OPENID_REFRESH_TIMEDELTA = timedelta(minutes=-5)
 """Default interval for refreshing CERN extra data (e.g. groups)."""
@@ -174,17 +176,37 @@ def fetch_extra_data(resource):
 
 def account_roles_and_extra_data(account, resource, refresh_timedelta=None):
     """Fetch account roles and extra data from resource if necessary."""
+    current_app.logger.warning(f"account_roles_and_extra_data resource: {resource}")
+    current_app.logger.warning(f"account_roles_and_extra_data account.extra_data: {account.extra_data.get('roles', [])}")
+    current_app.logger.warning(f"account_roles_and_extra_data account: {account}")
+
     updated = datetime.utcnow()
     modified_since = updated
     if refresh_timedelta is not None:
         modified_since += refresh_timedelta
     modified_since = modified_since.isoformat()
-    last_update = account.extra_data.get("updated", modified_since)
 
+    last_update = account.extra_data.get("updated", modified_since)
     if last_update > modified_since:
+        current_app.logger.warning(f"if last_update > modified_since")
+
         return account.extra_data.get("roles", [])
 
-    roles = resource["cern_roles"]
+    roles = resource.get("cern_roles")
+    current_app.logger.warning(f"account_roles_and_extra_data: cern_roles: {roles}")
+
+    valid_roles = current_app.config.get(
+        "OAUTHCLIENT_CERN_OPENID_ALLOWED_ROLES",
+        OAUTHCLIENT_CERN_OPENID_ALLOWED_ROLES,
+    )
+
+    if roles is None or not set(roles).issubset(valid_roles):
+        raise OAuthClientUnAuthorized(
+            "User roles {0} are not one of {1}".format(
+                roles, valid_roles
+            ),
+        )
+
     extra_data = current_app.config.get(
         "OAUTHCLIENT_CERN_OPENID_EXTRA_DATA_SERIALIZER", fetch_extra_data
     )(resource)
@@ -218,9 +240,16 @@ def disconnect_identity(identity):
     identity.provides -= provides
 
 
-def get_dict_from_response(response):
+def get_dict_from_response(response: OAuthResponse, remote: OAuthRemoteApp):
     """Prepare new mapping with 'Value's grouped by 'Type'."""
     result = {}
+    current_app.logger.warning(f"response code: {response._resp.code}")
+    current_app.logger.warning(f"response: {response._resp}")
+    current_app.logger.warning(f"response: {response.raw_data}")
+    current_app.logger.warning(f"response: {response._resp}")
+
+    current_app.logger.warning(f"response: {response._resp.headers}")
+
     if getattr(response, "_resp") and response._resp.code > 400:
         return result
 
@@ -229,38 +258,54 @@ def get_dict_from_response(response):
     return result
 
 
-def get_resource(remote, token_response=None):
+def get_resource(remote: OAuthRemoteApp, token_response=None):
     """Query CERN Resources to get user info and roles."""
     cached_resource = session.pop("cern_resource", None)
     if cached_resource:
+        current_app.logger.warning(f"cached resource: {cached_resource}")
         return cached_resource
 
     response = remote.get(REMOTE_APP_RESOURCE_API_URL)
-    dict_response = get_dict_from_response(response)
+    if response._resp.code == 401:
+        token_response = generate_token(remote)
+        response = remote.get(REMOTE_APP_RESOURCE_API_URL)
+
+    dict_response = get_dict_from_response(response, remote)
+    current_app.logger.warning(f"dict_response: {dict_response}")
+
+    token_response = token_response or remote.get_request_token()
     if token_response:
+        current_app.logger.warning(f"get_resource: token_response: {token_response}")
+
         token_data = decode(token_response["access_token"], verify=False)
         dict_response.update(token_data)
     session["cern_resource"] = dict_response
     return dict_response
 
 
-def _account_info(remote, resp):
-    """Retrieve remote account information used to find local user."""
-    resource = get_resource(remote, resp)
-
+def check_roles(remote, resp, cern_roles):
     valid_roles = current_app.config.get(
         "OAUTHCLIENT_CERN_OPENID_ALLOWED_ROLES",
         OAUTHCLIENT_CERN_OPENID_ALLOWED_ROLES,
     )
-    cern_roles = resource.get("cern_roles")
+
     if cern_roles is None or not set(cern_roles).issubset(valid_roles):
         raise OAuthCERNRejectedAccountError(
             "User roles {0} are not one of {1}".format(
                 cern_roles, valid_roles
             ),
             remote,
-            resp,
+            resp
         )
+
+    return cern_roles
+
+
+def _account_info(remote, resp):
+    """Retrieve remote account information used to find local user."""
+    resource = get_resource(remote, resp)
+
+    check_roles(remote, resp, resource.get("cern_roles"))
 
     email = resource["email"]
     person_id = resource.get("cern_person_id")
@@ -365,6 +410,8 @@ def on_identity_changed(sender, identity):
 
     :param identity: The user identity where information are stored.
     """
+    current_app.logger.warning(f"on_identity_changed identity:{identity}")
+
     if isinstance(identity, AnonymousIdentity):
         return
 
@@ -375,9 +422,15 @@ def on_identity_changed(sender, identity):
         user_id=current_user.get_id(), client_id=client_id
     )
     roles = []
+    current_app.logger.warning(f"on_identity_changed RemoteAccount:{account}")
+
     if account:
         remote = find_remote_by_client_id(client_id)
+        current_app.logger.warning(f"on_identity_changed remote:{remote}")
+
         resource = get_resource(remote)
+        current_app.logger.warning(f"on_identity_changed resource:{resource}")
+
         refresh = current_app.config.get(
             "OAUTHCLIENT_CERN_OPENID_REFRESH_TIMEDELTA",
             OAUTHCLIENT_CERN_OPENID_REFRESH_TIMEDELTA,
