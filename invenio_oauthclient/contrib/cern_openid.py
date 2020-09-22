@@ -193,19 +193,6 @@ def account_roles_and_extra_data(account, resource, refresh_timedelta=None):
         return account.extra_data.get("roles", [])
 
     roles = resource.get("cern_roles")
-    current_app.logger.warning(f"account_roles_and_extra_data: cern_roles: {roles}")
-
-    valid_roles = current_app.config.get(
-        "OAUTHCLIENT_CERN_OPENID_ALLOWED_ROLES",
-        OAUTHCLIENT_CERN_OPENID_ALLOWED_ROLES,
-    )
-
-    if roles is None or not set(roles).issubset(valid_roles):
-        raise OAuthClientUnAuthorized(
-            "User roles {0} are not one of {1}".format(
-                roles, valid_roles
-            ),
-        )
 
     extra_data = current_app.config.get(
         "OAUTHCLIENT_CERN_OPENID_EXTRA_DATA_SERIALIZER", fetch_extra_data
@@ -258,7 +245,7 @@ def get_dict_from_response(response: OAuthResponse, remote: OAuthRemoteApp):
     return result
 
 
-def get_resource(remote: OAuthRemoteApp, token_response=None):
+def get_resource(remote: OAuthRemoteApp, token_response):
     """Query CERN Resources to get user info and roles."""
     cached_resource = session.pop("cern_resource", None)
     if cached_resource:
@@ -271,15 +258,13 @@ def get_resource(remote: OAuthRemoteApp, token_response=None):
         response = remote.get(REMOTE_APP_RESOURCE_API_URL)
 
     dict_response = get_dict_from_response(response, remote)
-    current_app.logger.warning(f"dict_response: {dict_response}")
 
-    token_response = token_response or remote.get_request_token()
-    if token_response:
-        current_app.logger.warning(f"get_resource: token_response: {token_response}")
-
-        token_data = decode(token_response["access_token"], verify=False)
-        dict_response.update(token_data)
+    token_data = decode(token_response["access_token"], verify=False)
+    dict_response.update(token_data)
     session["cern_resource"] = dict_response
+
+    check_roles(remote, response, dict_response.get("cern_roles"))
+
     return dict_response
 
 
@@ -304,8 +289,6 @@ def check_roles(remote, resp, cern_roles):
 def _account_info(remote, resp):
     """Retrieve remote account information used to find local user."""
     resource = get_resource(remote, resp)
-
-    check_roles(remote, resp, resource.get("cern_roles"))
 
     email = resource["email"]
     person_id = resource.get("cern_person_id")
@@ -393,7 +376,7 @@ def account_setup(remote, token, resp):
 
         # Set CERN person ID in extra_data.
         token.remote_account.extra_data = {"external_id": external_id}
-        roles = account_roles_and_extra_data(token.remote_account, resource)
+        roles = account_roles_and_extra_data(remote, token.remote_account, resource)
         assert not isinstance(g.identity, AnonymousIdentity)
         extend_identity(g.identity, roles)
 
@@ -428,7 +411,7 @@ def on_identity_changed(sender, identity):
         remote = find_remote_by_client_id(client_id)
         current_app.logger.warning(f"on_identity_changed remote:{remote}")
 
-        resource = get_resource(remote)
+        resource = get_resource(remote, remote.get_request_token())
         current_app.logger.warning(f"on_identity_changed resource:{resource}")
 
         refresh = current_app.config.get(
